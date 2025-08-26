@@ -196,8 +196,8 @@ def val_epoch(model, loader, loss_function, device):
     total_loss = 0.0
     total_samples = 0
     
-    all_outputs = []
-    all_labels = []
+    # 直接在GPU上累积混淆矩阵，避免数据频繁转移
+    confusion_matrix = torch.zeros(3, 3, device=device)
     
     start_time = time.time()
     total_batches = len(loader)
@@ -216,41 +216,62 @@ def val_epoch(model, loader, loss_function, device):
             total_loss += loss.item() * batch_size
             total_samples += batch_size
             
-            # 保存输出和标签用于计算指标
-            all_outputs.append(outputs.cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
+            # 直接在GPU上计算预测值并更新混淆矩阵
+            _, predictions = torch.max(outputs, dim=1)
+            
+            # 高效计算混淆矩阵（避免循环）
+            for p, t in zip(predictions.flatten(), labels.flatten()):
+                if p < 3 and t < 3:  # 确保索引有效
+                    confusion_matrix[p, t] += 1
             
             # 打印批次进度
             if (i + 1) % 5 == 0 or (i + 1) == total_batches:
                 logger.info(f'  验证批次 {i+1}/{total_batches}, 批次损失: {loss.item():.4f}')
     
-    # 计算指标
-    all_outputs = np.concatenate(all_outputs, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
-    
-    # 转换为torch张量
-    all_outputs_tensor = torch.tensor(all_outputs, device=device)
-    all_labels_tensor = torch.tensor(all_labels, device=device)
-    
-    # 计算预测值
-    _, predictions = torch.max(all_outputs_tensor, dim=1)
-    
     # 计算每个类别的IoU
-    iou_scores = compute_iou(predictions, all_labels_tensor, num_classes=3)
-    miou = np.mean(iou_scores)
+    iou_list = []
+    for i in range(3):
+        true_positive = confusion_matrix[i, i].item()
+        false_positive = confusion_matrix[i, :].sum().item() - true_positive
+        false_negative = confusion_matrix[:, i].sum().item() - true_positive
+        
+        # 避免除以0
+        if true_positive + false_positive + false_negative == 0:
+            iou = 0.0
+        else:
+            iou = true_positive / (true_positive + false_positive + false_negative)
+        
+        iou_list.append(iou)
+    
+    miou = np.mean(iou_list)
     
     # 打印每个类别的IoU值
-    for i, iou in enumerate(iou_scores):
+    for i, iou in enumerate(iou_list):
         logger.info(f'类别{i} IoU: {iou:.4f}')
     logger.info(f'mIoU: {miou:.4f}')
     
-    # 计算准确率
-    accuracy = np.mean(predictions.cpu().numpy() == all_labels)
+    # 计算准确率 - 只需要混淆矩阵对角线元素
+    accuracy = confusion_matrix.diag().sum().item() / confusion_matrix.sum().item()
     logger.info(f'准确率: {accuracy:.4f}')
     
+    # 为了计算Recall和F1，只转移混淆矩阵到CPU，而不是整个数据集
+    confusion_matrix_cpu = confusion_matrix.cpu().numpy()
+    
     # 计算Recall和F1分数
-    recall = recall_score(all_labels.flatten(), predictions.cpu().numpy().flatten(), average=None, labels=[0, 1, 2], zero_division=0)
-    f1 = f1_score(all_labels.flatten(), predictions.cpu().numpy().flatten(), average=None, labels=[0, 1, 2], zero_division=0)
+    recall = []
+    f1 = []
+    for i in range(3):
+        tp = confusion_matrix_cpu[i, i]
+        fn = confusion_matrix_cpu[:, i].sum() - tp
+        fp = confusion_matrix_cpu[i, :].sum() - tp
+        
+        # 计算Recall
+        recall_val = tp / (tp + fn) if (tp + fn) > 0 else 0
+        recall.append(recall_val)
+        
+        # 计算F1
+        f1_val = 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+        f1.append(f1_val)
     
     mean_recall = np.mean(recall)
     mean_f1 = np.mean(f1)
